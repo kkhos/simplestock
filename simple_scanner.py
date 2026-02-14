@@ -1,200 +1,188 @@
-import json
-import urllib.request
+import yfinance as yf
+import pandas as pd
 import datetime
-import ssl
-import time
-import math
 
-# SSL 인증서 오류 방지
-ssl._create_default_https_context = ssl._create_unverified_context
-
-# --- 설정 ---
+# --- 설정 (Config) ---
+RSI_THRESHOLD_LOW = 30   # 과매도 (매수 고려)
+RSI_THRESHOLD_HIGH = 70  # 과매수 (매도 고려)
 RSI_PERIOD = 14
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
-BB_PERIOD = 20
-BB_STD_DEV = 2
 
-# --- 감시 대상 (Top 100) ---
-tickers_kr = [
-    '005930.KS', '373220.KS', '000660.KS', '207940.KS', '005380.KS',
-    '006400.KS', '051910.KS', '000270.KS', '035420.KS', '035720.KS',
-    '005490.KS', '012330.KS', '028260.KS', '105560.KS', '055550.KS',
-    '068270.KS', '032830.KS', '096770.KS', '003550.KS', '015760.KS',
-    '034020.KS', '086790.KS', '033780.KS', '009150.KS', '017670.KS',
-    '018260.KS', '010130.KS', '003490.KS', '034730.KS', '036570.KS',
-    '009830.KS', '011200.KS', '051900.KS', '090430.KS', '010950.KS',
-    '000810.KS', '024110.KS', '030200.KS', '011170.KS', '011070.KS',
-    '005830.KS', '034220.KS', '001450.KS', '004020.KS', '047810.KS',
-    '028050.KS', '000100.KS', '071050.KS', '086280.KS', '002790.KS'
-]
+# --- 감시 대상 종목 (Watchlist) ---
+# 한국 주식 (KOSPI Top 10 + 주요 종목)
+watchlist_kr = {
+    '005930.KS': '삼성전자',
+    '373220.KS': 'LG에너지솔루션',
+    '000660.KS': 'SK하이닉스',
+    '207940.KS': '삼성바이오로직스',
+    '005380.KS': '현대차',
+    '006400.KS': '삼성SDI',
+    '051910.KS': 'LG화학',
+    '000270.KS': '기아',
+    '035420.KS': 'NAVER',
+    '035720.KS': '카카오'
+}
 
-tickers_us = [
-    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'META', 'NFLX', 'AMD', 'INTC',
-    'AVGO', 'CSCO', 'PEP', 'COST', 'TMUS', 'ADBE', 'TXN', 'CMCSA', 'QCOM', 'HON',
-    'INTU', 'AMGN', 'SBUX', 'GILD', 'MDLZ', 'BKNG', 'ADI', 'ADP', 'ISRG', 'REGN',
-    'VRTX', 'FISV', 'LRCX', 'ATVI', 'MU', 'MELI', 'CSX', 'PANW', 'MRNA', 'SNPS',
-    'CDNS', 'ASML', 'KLAC', 'MAR', 'CTAS', 'KDP', 'AEP', 'NXPI', 'ORLY', 'DXCM'
-]
+# 미국 주식 (S&P 500 Top 10 + 주요 기술주)
+watchlist_us = {
+    'AAPL': 'Apple',
+    'MSFT': 'Microsoft',
+    'GOOGL': 'Alphabet (Google)',
+    'AMZN': 'Amazon',
+    'TSLA': 'Tesla',
+    'NVDA': 'NVIDIA',
+    'META': 'Meta (Facebook)',
+    'NFLX': 'Netflix',
+    'AMD': 'AMD',
+    'INTC': 'Intel'
+}
 
-watchlist = [{'ticker': t, 'market': 'KR'} for t in tickers_kr] + \
-            [{'ticker': t, 'market': 'US'} for t in tickers_us]
+def calculate_indicators(df):
+    """
+    RSI, MACD, Bollinger Bands 계산
+    """
+    if df.empty or len(df) < 50:
+        return None
 
-def get_price_history(ticker):
-    """Yahoo Finance API 호출"""
-    # 충분한 데이터 확보 (MACD, 볼린저 밴드 계산 위해 6개월치)
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=6mo"
-    headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'}
-    
-    for _ in range(3):
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=5) as response:
-                data = json.loads(response.read().decode('utf-8'))
-            
-            result = data['chart']['result'][0]
-            quote = result['indicators']['quote'][0]
-            closes = quote['close']
-            return [c for c in closes if c is not None]
-        except Exception:
-            time.sleep(1)
-    return []
+    # 1. RSI (Relative Strength Index)
+    delta = df['Close'].diff(1)
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
 
-def calculate_indicators(prices):
-    """RSI, MACD, Bollinger Band 계산"""
-    if len(prices) < 50: return None # 데이터 부족
+    avg_gain = gain.rolling(window=RSI_PERIOD).mean()
+    avg_loss = loss.rolling(window=RSI_PERIOD).mean()
 
-    # 1. RSI
-    gains, losses = [], []
-    for i in range(1, len(prices)):
-        delta = prices[i] - prices[i-1]
-        if delta > 0: gains.append(delta); losses.append(0)
-        else: gains.append(0); losses.append(abs(delta))
-    
-    avg_gain = sum(gains[:RSI_PERIOD]) / RSI_PERIOD
-    avg_loss = sum(losses[:RSI_PERIOD]) / RSI_PERIOD
-    
-    rsi = 100 - (100 / (1 + (avg_gain / avg_loss if avg_loss != 0 else 0)))
-    
-    for i in range(RSI_PERIOD, len(gains)):
-        avg_gain = (avg_gain * (RSI_PERIOD - 1) + gains[i]) / RSI_PERIOD
-        avg_loss = (avg_loss * (RSI_PERIOD - 1) + losses[i]) / RSI_PERIOD
-        rsi = 100 - (100 / (1 + (avg_gain / avg_loss if avg_loss != 0 else 0)))
+    rs = avg_gain / avg_loss
+    df['RSI'] = 100 - (100 / (1 + rs))
 
-    # 2. MACD (EMA 방식)
-    def ema(data, period):
-        k = 2 / (period + 1)
-        res = [data[0]]
-        for i in range(1, len(data)):
-            res.append(data[i] * k + res[-1] * (1-k))
-        return res
+    # 2. MACD (Moving Average Convergence Divergence)
+    # EMA(12) - EMA(26)
+    ema12 = df['Close'].ewm(span=12, adjust=False).mean()
+    ema26 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = ema12 - ema26
+    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
 
-    ema_12 = ema(prices, MACD_FAST)
-    ema_26 = ema(prices, MACD_SLOW)
-    macd_line = [a - b for a, b in zip(ema_12, ema_26)] # MACD Line
-    signal_line = ema(macd_line, MACD_SIGNAL)           # Signal Line
-    
-    # 3. Bollinger Bands (SMA 방식)
-    sma_20 = sum(prices[-BB_PERIOD:]) / BB_PERIOD
-    variance = sum([(x - sma_20) ** 2 for x in prices[-BB_PERIOD:]]) / BB_PERIOD
-    std_dev = math.sqrt(variance)
-    
-    upper_band = sma_20 + (std_dev * BB_STD_DEV)
-    lower_band = sma_20 - (std_dev * BB_STD_DEV)
+    # 3. Bollinger Bands (20일 이동평균, 표준편차 2배)
+    df['MA20'] = df['Close'].rolling(window=20).mean()
+    df['STD20'] = df['Close'].rolling(window=20).std()
+    df['Upper_Band'] = df['MA20'] + (df['STD20'] * 2)
+    df['Lower_Band'] = df['MA20'] - (df['STD20'] * 2)
 
-    return {
-        'rsi': rsi,
-        'macd': macd_line[-1],
-        'signal': signal_line[-1],
-        'macd_prev': macd_line[-2],
-        'signal_prev': signal_line[-2],
-        'upper': upper_band,
-        'lower': lower_band,
-        'price': prices[-1]
-    }
+    return df
 
-def analyze_stock(ticker, market):
-    prices = get_price_history(ticker)
-    if not prices: return None
-    
-    ind = calculate_indicators(prices)
-    if not ind: return None
-    
-    score = 0
-    reasons = []
-    
-    # 1. RSI (30점)
-    if ind['rsi'] <= 30:
-        score += 30
-        reasons.append(f"RSI 과매도({ind['rsi']:.1f})")
-    elif ind['rsi'] <= 40:
-        score += 15
-        reasons.append(f"RSI 저점({ind['rsi']:.1f})")
+def analyze_stock(ticker, name, market):
+    """개별 종목 분석 및 신호 포착"""
+    try:
+        stock = yf.Ticker(ticker)
+        df = stock.history(period="6mo")
 
-    # 2. MACD (40점) - 골든크로스 발생
-    # (어제는 MACD < Signal 이었는데, 오늘은 MACD > Signal)
-    if ind['macd_prev'] < ind['signal_prev'] and ind['macd'] > ind['signal']:
-        score += 40
-        reasons.append("MACD 골든크로스(상승전환)")
-    elif ind['macd'] > ind['signal']:
-        score += 10 # 정배열 유지 중
+        df = calculate_indicators(df)
+        if df is None:
+            return None
 
-    # 3. Bollinger Band (30점) - 하단 터치 근접
-    pct_b = (ind['price'] - ind['lower']) / (ind['upper'] - ind['lower'])
-    if pct_b <= 0.05: # 하단 밴드 5% 이내 근접
-        score += 30
-        reasons.append("볼린저밴드 하단 터치(반등기대)")
-    elif pct_b >= 1.0: # 상단 돌파
-        score -= 20 # 과매수 경고
-        reasons.append("볼린저밴드 상단 돌파(과열)")
+        # 마지막 데이터 확인
+        last_row = df.iloc[-1]
+        prev_row = df.iloc[-2] # 전일 데이터 (크로스 확인용)
 
-    return {
-        'ticker': ticker,
-        'market': market,
-        'price': ind['price'],
-        'score': score,
-        'reasons': reasons,
-        'indicators': ind
-    }
+        last_rsi = last_row['RSI']
+        last_macd = last_row['MACD']
+        last_signal = last_row['Signal_Line']
+        last_price = last_row['Close']
+        lower_band = last_row['Lower_Band']
+        upper_band = last_row['Upper_Band']
+
+        score = 0
+        reasons = []
+
+        # --- 매수 신호 (Score 계산) ---
+        # 1. RSI 과매도 구간 (30점)
+        if last_rsi <= RSI_THRESHOLD_LOW:
+            score += 30
+            reasons.append(f"RSI 과매도({last_rsi:.1f})")
+        elif last_rsi <= 40:
+            score += 10
+            reasons.append(f"RSI 저점({last_rsi:.1f})")
+
+        # 2. MACD 골든크로스 (40점)
+        # (어제는 MACD < Signal 이었는데, 오늘은 MACD > Signal)
+        if prev_row['MACD'] < prev_row['Signal_Line'] and last_macd > last_signal:
+            score += 40
+            reasons.append("MACD 골든크로스(상승전환)")
+        elif last_macd > last_signal:
+            score += 10 # 정배열 유지 중
+
+        # 3. 볼린저 밴드 하단 터치 (30점)
+        # 주가가 하단 밴드 근처(3% 이내)에 있거나 터치함
+        if last_price <= lower_band * 1.03:
+            score += 30
+            reasons.append("볼린저밴드 하단 근접(반등기대)")
+        
+        # --- 매도 신호 (Score 차감) ---
+        if last_rsi >= RSI_THRESHOLD_HIGH:
+            score -= 20
+            reasons.append("RSI 과매수(주의)")
+        
+        if last_price >= upper_band * 0.97:
+             score -= 10
+             reasons.append("볼린저밴드 상단 근접(저항)")
+
+
+        if score >= 40: # 유의미한 매수 신호만 리턴
+            return {
+                'ticker': ticker,
+                'name': name,
+                'market': market,
+                'price': last_price,
+                'score': score,
+                'reasons': reasons,
+                'rsi': last_rsi
+            }
+        
+        return None
+
+    except Exception as e:
+        # print(f"Error analyzing {name}: {e}")
+        return None
 
 def main():
-    print(f"📊 **Smart Stock Radar (MACD+RSI+Bollinger)**")
+    print(f"📊 **Smart Stock Radar (RSI + MACD + Bollinger)**")
     print(f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("-" * 50)
-    
-    strong_buys = []
-    buys = []
-    
-    total = len(watchlist)
-    
-    for idx, item in enumerate(watchlist):
-        if idx % 10 == 0: time.sleep(1) # 부하 조절
-            
-        res = analyze_stock(item['ticker'], item['market'])
-        if not res: continue
-        
-        if res['score'] >= 60: # 강력 매수
-            strong_buys.append(res)
-        elif res['score'] >= 40: # 매수 관심
-            buys.append(res)
 
-    # 결과 출력
-    if not strong_buys and not buys:
-        print("✅ **특이사항 없음** (뚜렷한 매수 신호 미포착)")
+    signals = []
+
+    # 1. 한국 주식 스캔
+    print("🇰🇷 Scanning KOSPI...")
+    for ticker, name in watchlist_kr.items():
+        result = analyze_stock(ticker, name, 'KR')
+        if result:
+            signals.append(result)
+
+    # 2. 미국 주식 스캔
+    print("🇺🇸 Scanning US Tech...")
+    for ticker, name in watchlist_us.items():
+        result = analyze_stock(ticker, name, 'US')
+        if result:
+            signals.append(result)
+
+    print("-" * 50)
+    
+    # 점수 높은 순 정렬
+    signals.sort(key=lambda x: x['score'], reverse=True)
+
+    if not signals:
+        print("✅ **특이사항 없음** (관망세)")
     else:
-        if strong_buys:
-            print(f"\n🚀 **STRONG BUY (Score 60+)**")
-            for s in strong_buys:
-                currency = "₩" if s['market'] == 'KR' else "$"
-                print(f"**{s['ticker']}** ({currency}{s['price']:,.0f})")
-                print(f"   Score: {s['score']}점 / {', '.join(s['reasons'])}")
-                
-        if buys:
-            print(f"\n👀 **Watch List (Score 40+)**")
-            for s in buys[:5]: # 너무 많으면 5개만
-                currency = "₩" if s['market'] == 'KR' else "$"
-                print(f"- **{s['ticker']}**: {', '.join(s['reasons'])}")
+        print(f"🚨 **Found {len(signals)} Buying Opportunities!**\n")
+        
+        for s in signals:
+            currency = "₩" if s['market'] == 'KR' else "$"
+            icon = "🚀" if s['score'] >= 60 else "👀"
+            
+            print(f"{icon} **{s['name']} ({s['ticker']})**")
+            print(f"   Score: {s['score']}점")
+            print(f"   Price: {currency}{s['price']:,.0f}")
+            print(f"   Signals: {', '.join(s['reasons'])}")
+            print("")
 
 if __name__ == "__main__":
     main()
