@@ -1,6 +1,9 @@
 import yfinance as yf
 import pandas as pd
 import datetime
+import re
+import requests
+from bs4 import BeautifulSoup
 
 # --- 설정 (Config) ---
 RSI_THRESHOLD_LOW = 30   # 과매도 (매수 고려)
@@ -11,9 +14,20 @@ TREND_SLOW_EMA = 200
 VOLUME_SPIKE_MULTIPLIER = 1.5
 ATR_PERIOD = 14
 
-# --- 감시 대상 종목 (Watchlist) ---
-# 한국 주식 (KOSPI Top 10 + 주요 종목)
-watchlist_kr = {
+FALLBACK_US = {
+    'AAPL': 'Apple',
+    'MSFT': 'Microsoft',
+    'GOOGL': 'Alphabet (Google)',
+    'AMZN': 'Amazon',
+    'TSLA': 'Tesla',
+    'NVDA': 'NVIDIA',
+    'META': 'Meta (Facebook)',
+    'NFLX': 'Netflix',
+    'AMD': 'AMD',
+    'INTC': 'Intel'
+}
+
+FALLBACK_KR = {
     '005930.KS': '삼성전자',
     '373220.KS': 'LG에너지솔루션',
     '000660.KS': 'SK하이닉스',
@@ -26,19 +40,90 @@ watchlist_kr = {
     '035720.KS': '카카오'
 }
 
-# 미국 주식 (S&P 500 Top 10 + 주요 기술주)
-watchlist_us = {
-    'AAPL': 'Apple',
-    'MSFT': 'Microsoft',
-    'GOOGL': 'Alphabet (Google)',
-    'AMZN': 'Amazon',
-    'TSLA': 'Tesla',
-    'NVDA': 'NVIDIA',
-    'META': 'Meta (Facebook)',
-    'NFLX': 'Netflix',
-    'AMD': 'AMD',
-    'INTC': 'Intel'
-}
+
+def fetch_us_top100():
+    """
+    미국 시가총액 상위 100개 (S&P500 시총 순 정렬 기준) 티커를 수집.
+    """
+    url = "https://www.slickcharts.com/sp500"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(url, headers=headers, timeout=10)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    rows = soup.select("table.table tbody tr")
+    if not rows:
+        return None
+
+    result = {}
+    for row in rows:
+        tds = row.select("td")
+        if len(tds) < 3:
+            continue
+        name = tds[1].get_text(strip=True)
+        ticker = tds[2].get_text(strip=True).replace(".", "-")
+        if ticker:
+            result[ticker] = name
+        if len(result) >= 100:
+            break
+
+    return result if len(result) >= 100 else None
+
+
+def fetch_kr_top100():
+    """
+    한국 시가총액 상위 100개 (네이버 금융 KOSPI 시총 순) 티커를 수집.
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+    result = {}
+
+    excluded_keywords = ("ETF", "ETN", "스팩", "SPAC")
+
+    for page in range(1, 21):
+        url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok=0&page={page}"
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        links = soup.select("a.tltle")
+        for link in links:
+            name = link.get_text(strip=True)
+            if any(keyword in name for keyword in excluded_keywords):
+                continue
+            href = link.get("href", "")
+            match = re.search(r"code=(\d{6})", href)
+            if not match:
+                continue
+
+            ticker = f"{match.group(1)}.KS"
+            result[ticker] = name
+            if len(result) >= 100:
+                return result
+
+    return result if len(result) >= 100 else None
+
+
+def build_watchlists():
+    """
+    동적 Top100 watchlist를 구성하고, 실패 시 fallback 사용.
+    """
+    watchlist_us = FALLBACK_US.copy()
+    watchlist_kr = FALLBACK_KR.copy()
+
+    try:
+        dynamic_us = fetch_us_top100()
+        if dynamic_us:
+            watchlist_us = dynamic_us
+    except Exception:
+        pass
+
+    try:
+        dynamic_kr = fetch_kr_top100()
+        if dynamic_kr:
+            watchlist_kr = dynamic_kr
+    except Exception:
+        pass
+
+    return watchlist_kr, watchlist_us
 
 def calculate_indicators(df):
     """
@@ -191,16 +276,18 @@ def main():
     print("-" * 50)
 
     signals = []
+    watchlist_kr, watchlist_us = build_watchlists()
+    print(f"Universe: KR {len(watchlist_kr)}개 / US {len(watchlist_us)}개")
 
     # 1. 한국 주식 스캔
-    print("🇰🇷 Scanning KOSPI...")
+    print("🇰🇷 Scanning KOSPI Top100...")
     for ticker, name in watchlist_kr.items():
         result = analyze_stock(ticker, name, 'KR')
         if result:
             signals.append(result)
 
     # 2. 미국 주식 스캔
-    print("🇺🇸 Scanning US Tech...")
+    print("🇺🇸 Scanning US Top100...")
     for ticker, name in watchlist_us.items():
         result = analyze_stock(ticker, name, 'US')
         if result:
