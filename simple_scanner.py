@@ -6,6 +6,10 @@ import datetime
 RSI_THRESHOLD_LOW = 30   # 과매도 (매수 고려)
 RSI_THRESHOLD_HIGH = 70  # 과매수 (매도 고려)
 RSI_PERIOD = 14
+TREND_FAST_EMA = 50
+TREND_SLOW_EMA = 200
+VOLUME_SPIKE_MULTIPLIER = 1.5
+ATR_PERIOD = 14
 
 # --- 감시 대상 종목 (Watchlist) ---
 # 한국 주식 (KOSPI Top 10 + 주요 종목)
@@ -38,9 +42,9 @@ watchlist_us = {
 
 def calculate_indicators(df):
     """
-    RSI, MACD, Bollinger Bands 계산
+    RSI, MACD, Bollinger Bands, EMA, Volume MA, ATR 계산
     """
-    if df.empty or len(df) < 50:
+    if df.empty or len(df) < TREND_SLOW_EMA + 20:
         return None
 
     # 1. RSI (Relative Strength Index)
@@ -67,13 +71,31 @@ def calculate_indicators(df):
     df['Upper_Band'] = df['MA20'] + (df['STD20'] * 2)
     df['Lower_Band'] = df['MA20'] - (df['STD20'] * 2)
 
+    # 4. Trend filter / Volume filter
+    df['EMA50'] = df['Close'].ewm(span=TREND_FAST_EMA, adjust=False).mean()
+    df['EMA200'] = df['Close'].ewm(span=TREND_SLOW_EMA, adjust=False).mean()
+    df['Volume_MA20'] = df['Volume'].rolling(window=20).mean()
+
+    # 5. ATR(14): 변동성 기반 리스크 관리
+    prev_close = df['Close'].shift(1)
+    tr_components = pd.concat(
+        [
+            (df['High'] - df['Low']).abs(),
+            (df['High'] - prev_close).abs(),
+            (df['Low'] - prev_close).abs(),
+        ],
+        axis=1,
+    )
+    df['TR'] = tr_components.max(axis=1)
+    df['ATR14'] = df['TR'].rolling(window=ATR_PERIOD).mean()
+
     return df
 
 def analyze_stock(ticker, name, market):
     """개별 종목 분석 및 신호 포착"""
     try:
         stock = yf.Ticker(ticker)
-        df = stock.history(period="6mo")
+        df = stock.history(period="1y")
 
         df = calculate_indicators(df)
         if df is None:
@@ -89,6 +111,18 @@ def analyze_stock(ticker, name, market):
         last_price = last_row['Close']
         lower_band = last_row['Lower_Band']
         upper_band = last_row['Upper_Band']
+        ema50 = last_row['EMA50']
+        ema200 = last_row['EMA200']
+        last_volume = last_row['Volume']
+        volume_ma20 = last_row['Volume_MA20']
+        atr14 = last_row['ATR14']
+
+        if pd.isna(last_rsi) or pd.isna(ema50) or pd.isna(ema200) or pd.isna(volume_ma20) or pd.isna(atr14):
+            return None
+
+        # 하락추세에서의 낙폭과대 시그널을 줄이기 위한 추세 필터
+        if not (last_price > ema200 and ema50 > ema200):
+            return None
 
         score = 0
         reasons = []
@@ -115,6 +149,11 @@ def analyze_stock(ticker, name, market):
         if last_price <= lower_band * 1.03:
             score += 30
             reasons.append("볼린저밴드 하단 근접(반등기대)")
+
+        # 4. 거래량 급증 확인 (신호 강화)
+        if last_volume >= volume_ma20 * VOLUME_SPIKE_MULTIPLIER:
+            score += 15
+            reasons.append(f"거래량 급증({last_volume / volume_ma20:.1f}x)")
         
         # --- 매도 신호 (Score 차감) ---
         if last_rsi >= RSI_THRESHOLD_HIGH:
@@ -134,7 +173,10 @@ def analyze_stock(ticker, name, market):
                 'price': last_price,
                 'score': score,
                 'reasons': reasons,
-                'rsi': last_rsi
+                'rsi': last_rsi,
+                'atr': atr14,
+                'stop_loss': max(last_price - (1.5 * atr14), 0),
+                'take_profit_1': last_price + (2 * atr14),
             }
         
         return None
@@ -144,7 +186,7 @@ def analyze_stock(ticker, name, market):
         return None
 
 def main():
-    print(f"📊 **Smart Stock Radar (RSI + MACD + Bollinger)**")
+    print(f"📊 **Smart Stock Radar (Trend + RSI + MACD + Bollinger + ATR)**")
     print(f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("-" * 50)
 
@@ -181,6 +223,7 @@ def main():
             print(f"{icon} **{s['name']} ({s['ticker']})**")
             print(f"   Score: {s['score']}점")
             print(f"   Price: {currency}{s['price']:,.0f}")
+            print(f"   Risk: ATR14 {s['atr']:.2f} | SL {currency}{s['stop_loss']:,.0f} | TP1 {currency}{s['take_profit_1']:,.0f}")
             print(f"   Signals: {', '.join(s['reasons'])}")
             print("")
 
