@@ -205,52 +205,64 @@ def analyze_stock(ticker, name, market):
         if pd.isna(last_rsi) or pd.isna(ema50) or pd.isna(ema200) or pd.isna(volume_ma20) or pd.isna(atr14):
             return None
 
-        # 하락추세에서의 낙폭과대 시그널을 줄이기 위한 추세 필터
-        if not (last_price > ema200 and ema50 > ema200):
-            return None
+        high_52w = df['High'].rolling(window=252, min_periods=100).max().iloc[-1]
 
         score = 0
+        short_score = 0
         reasons = []
+        short_reasons = []
 
-        # --- 매수 신호 (Score 계산) ---
-        # 1. RSI 과매도 구간 (30점)
-        if last_rsi <= RSI_THRESHOLD_LOW:
-            score += 30
-            reasons.append(f"RSI 과매도({last_rsi:.1f})")
-        elif last_rsi <= 40:
-            score += 10
-            reasons.append(f"RSI 저점({last_rsi:.1f})")
+        # --- 1. 롱(Buy) 포지션 스캔 ---
+        # 상승추세 필터 (정배열)
+        if last_price > ema200 and ema50 > ema200:
+            if last_rsi <= RSI_THRESHOLD_LOW:
+                score += 30
+                reasons.append(f"RSI 과매도({last_rsi:.1f})")
+            elif last_rsi <= 40:
+                score += 10
+                reasons.append(f"RSI 저점({last_rsi:.1f})")
 
-        # 2. MACD 골든크로스 (40점)
-        # (어제는 MACD < Signal 이었는데, 오늘은 MACD > Signal)
-        if prev_row['MACD'] < prev_row['Signal_Line'] and last_macd > last_signal:
-            score += 40
-            reasons.append("MACD 골든크로스(상승전환)")
-        elif last_macd > last_signal:
-            score += 10 # 정배열 유지 중
+            if prev_row['MACD'] < prev_row['Signal_Line'] and last_macd > last_signal:
+                score += 40
+                reasons.append("MACD 골든크로스(상승전환)")
+            elif last_macd > last_signal:
+                score += 10 # 정배열 유지 중
 
-        # 3. 볼린저 밴드 하단 터치 (30점)
-        # 주가가 하단 밴드 근처(3% 이내)에 있거나 터치함
-        if last_price <= lower_band * 1.03:
-            score += 30
-            reasons.append("볼린저밴드 하단 근접(반등기대)")
+            if last_price <= lower_band * 1.03:
+                score += 30
+                reasons.append("볼린저밴드 하단 근접(반등기대)")
 
-        # 4. 거래량 급증 확인 (신호 강화)
-        if last_volume >= volume_ma20 * VOLUME_SPIKE_MULTIPLIER:
-            score += 15
-            reasons.append(f"거래량 급증({last_volume / volume_ma20:.1f}x)")
-        
-        # --- 매도 신호 (Score 차감) ---
-        if last_rsi >= RSI_THRESHOLD_HIGH:
-            score -= 20
-            reasons.append("RSI 과매수(주의)")
-        
-        if last_price >= upper_band * 0.97:
-             score -= 10
-             reasons.append("볼린저밴드 상단 근접(저항)")
+            if last_volume >= volume_ma20 * VOLUME_SPIKE_MULTIPLIER:
+                score += 15
+                reasons.append(f"거래량 급증({last_volume / volume_ma20:.1f}x)")
+            
+            if last_rsi >= RSI_THRESHOLD_HIGH:
+                score -= 20
+                reasons.append("RSI 과매수(주의)")
+            
+            if last_price >= upper_band * 0.97:
+                 score -= 10
+                 reasons.append("볼린저밴드 상단 근접(저항)")
 
+        # --- 2. 숏(Short) 포지션 스캔 (윌리엄 오닐 기법) ---
+        # 조건: 고점 대비 15% 이상 하락 & 50일선 아래 & 50일선으로 거래량 없이 반등(Pullback)
+        is_former_leader = (last_price < high_52w * 0.85)
+        is_below_50 = last_price < ema50
+        is_pullback_to_50 = (last_price >= ema50 * 0.96) # 50일선 4% 이내로 근접
+        is_low_volume = last_volume < volume_ma20 * 0.8 # 거래량 부진 (가짜 반등)
 
-        if score >= 40: # 유의미한 매수 신호만 리턴
+        if is_former_leader and is_below_50 and is_pullback_to_50:
+            short_score += 40
+            short_reasons.append("50일선 저항/가짜 반등(O'Neil Short)")
+            if is_low_volume:
+                short_score += 20
+                short_reasons.append(f"거래량 부진({last_volume / volume_ma20:.1f}x)")
+            if ema50 < ema200:
+                short_score += 10
+                short_reasons.append("역배열(Death Cross 상태)")
+
+        # 둘 중 더 강한 시그널을 리턴
+        if score >= 40 and score >= short_score:
             return {
                 'ticker': ticker,
                 'name': name,
@@ -260,8 +272,23 @@ def analyze_stock(ticker, name, market):
                 'reasons': reasons,
                 'rsi': last_rsi,
                 'atr': atr14,
+                'type': 'LONG (매수)',
                 'stop_loss': max(last_price - (1.5 * atr14), 0),
                 'take_profit_1': last_price + (2 * atr14),
+            }
+        elif short_score >= 50:
+            return {
+                'ticker': ticker,
+                'name': name,
+                'market': market,
+                'price': last_price,
+                'score': short_score,
+                'reasons': short_reasons,
+                'rsi': last_rsi,
+                'atr': atr14,
+                'type': 'SHORT (공매도)',
+                'stop_loss': last_price + (1.5 * atr14),
+                'take_profit_1': max(last_price - (3 * atr14), 0),
             }
         
         return None
@@ -301,16 +328,24 @@ def main():
     if not signals:
         print("✅ **특이사항 없음** (관망세)")
     else:
-        print(f"🚨 **Found {len(signals)} Buying Opportunities!**\n")
+        print(f"🚨 **Found {len(signals)} Actionable Setups!**\n")
         
         for s in signals:
             currency = "₩" if s['market'] == 'KR' else "$"
-            icon = "🚀" if s['score'] >= 60 else "👀"
             
-            print(f"{icon} **{s['name']} ({s['ticker']})**")
+            if "SHORT" in s.get('type', ''):
+                icon = "🩸" if s['score'] >= 60 else "📉"
+            else:
+                icon = "🚀" if s['score'] >= 60 else "👀"
+            
+            print(f"{icon} **[{s.get('type', 'LONG')}] {s['name']} ({s['ticker']})**")
             print(f"   Score: {s['score']}점")
-            print(f"   Price: {currency}{s['price']:,.0f}")
-            print(f"   Risk: ATR14 {s['atr']:.2f} | SL {currency}{s['stop_loss']:,.0f} | TP1 {currency}{s['take_profit_1']:,.0f}")
+            if s['market'] == 'KR':
+                print(f"   Price: {currency}{s['price']:,.0f}")
+                print(f"   Risk: ATR14 {s['atr']:.0f} | SL {currency}{s['stop_loss']:,.0f} | TP1 {currency}{s['take_profit_1']:,.0f}")
+            else:
+                print(f"   Price: {currency}{s['price']:,.2f}")
+                print(f"   Risk: ATR14 {s['atr']:.2f} | SL {currency}{s['stop_loss']:,.2f} | TP1 {currency}{s['take_profit_1']:,.2f}")
             print(f"   Signals: {', '.join(s['reasons'])}")
             print("")
 
