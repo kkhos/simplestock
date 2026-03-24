@@ -4,6 +4,8 @@ import datetime
 import re
 import requests
 from bs4 import BeautifulSoup
+import csv
+import os
 
 # --- 설정 (Config) ---
 RSI_THRESHOLD_LOW = 30   # 과매도 (매수 고려)
@@ -325,12 +327,40 @@ def main():
     # 점수 높은 순 정렬
     signals.sort(key=lambda x: x['score'], reverse=True)
 
+    # --- 가상 매매(Paper Trading) 기록 로직 ---
+    today_str = datetime.datetime.now().strftime('%Y-%m-%d')
+    trade_log_file = 'paper_trades.csv'
+    logged_tickers = set()
+    
+    if os.path.exists(trade_log_file):
+        with open(trade_log_file, 'r', encoding='utf-8-sig') as f:
+            reader = csv.reader(f)
+            next(reader, None) # skip header
+            for row in reader:
+                if row and row[0] == today_str:
+                    logged_tickers.add(row[1])
+
     if not signals:
         print("✅ **특이사항 없음** (관망세)")
     else:
         print(f"🚨 **Found {len(signals)} Actionable Setups!**\n")
         
         for s in signals:
+            # 60점 이상 강력 신호는 가상 매매 장부에 기록 (하루 1회 제한)
+            if s['score'] >= 60 and s['ticker'] not in logged_tickers:
+                file_exists = os.path.isfile(trade_log_file)
+                with open(trade_log_file, mode='a', newline='', encoding='utf-8-sig') as f:
+                    writer = csv.writer(f)
+                    if not file_exists:
+                        writer.writerow(['Date', 'Ticker', 'Name', 'Market', 'Type', 'Entry_Price', 'SL', 'TP', 'Score', 'Reasons'])
+                    writer.writerow([
+                        today_str, s['ticker'], s['name'], s['market'], s.get('type', 'LONG'),
+                        round(s['price'], 2), round(s['stop_loss'], 2), round(s['take_profit_1'], 2),
+                        s['score'], " | ".join(s['reasons'])
+                    ])
+
+            currency = "₩" if s['market'] == 'KR' else "$"
+
             currency = "₩" if s['market'] == 'KR' else "$"
             
             if "SHORT" in s.get('type', ''):
